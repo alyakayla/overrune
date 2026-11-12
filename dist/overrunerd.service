@@ -1,0 +1,8 @@
+[Unit]
+Description=overrune GPU control daemon
+Requires=overrunerd.socket
+After=overrunerd.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/overrunerd
