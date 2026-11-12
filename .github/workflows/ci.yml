@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [overrune-mvp]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Tests that need a real NVIDIA device skip themselves on GPU-less runners;
+  # nvml-wrapper dlopens libnvidia-ml, so the build never needs one.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo llvm-cov --workspace --locked --summary-only --fail-under-lines 60
+
+      # The shipped units and polkit action are never exercised by cargo.
+      - run: sh -n dist/install.sh
+      - name: Units and polkit action parse
+        run: |
+          mkdir -p /tmp/units && cp dist/*.service dist/*.socket /tmp/units/
+          sed -i 's#^ExecStart=.*#ExecStart=/bin/true#' /tmp/units/*.service
+          systemd-analyze verify /tmp/units/overrunerd.socket /tmp/units/*.service
+          xmllint --noout dist/com.github.overrune.manage.policy
+
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Conventional commit subjects
+        run: |
+          bad=$(git log --no-merges --format=%s ${{ github.event.pull_request.base.sha }}..HEAD |
+            grep -vE '^(feat|fix|docs|test|refactor|perf|chore|ci)(\([a-z0-9-]+\))?!?: .{1,80}$') || true
+          [ -z "$bad" ] || { printf '::error::not Conventional Commits:\n%s\n' "$bad"; exit 1; }
