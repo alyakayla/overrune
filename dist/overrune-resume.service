@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply overrune GPU profile after suspend or hibernate
+After=suspend.target hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/overrune-reapply
+
+[Install]
+WantedBy=suspend.target hibernate.target

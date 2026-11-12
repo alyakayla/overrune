@@ -1,0 +1,10 @@
+[Unit]
+Description=overrune daemon socket
+
+[Socket]
+ListenStream=/run/overrune/overrunerd.sock
+SocketMode=0660
+SocketGroup=wheel
+
+[Install]
+WantedBy=sockets.target
