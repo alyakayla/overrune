@@ -58,6 +58,9 @@ fn human_output_names_the_device_and_temperature() {
 
 #[test]
 fn status_succeeds_with_no_daemon_socket() {
+    if overrune_core::Gpu::open().is_err() {
+        return; // `status` reads real hardware. CI runners have no device.
+    }
     let bin = env!("CARGO_BIN_EXE_overrune");
     for args in [&["--json"][..], &[][..], &["json"][..]] {
         let out = Command::new(bin)
