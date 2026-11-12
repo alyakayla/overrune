@@ -130,7 +130,6 @@ impl Gpu {
         let dev = nvml.device_by_index(index)?;
         let bus_id = dev.pci_info()?.bus_id;
         let name = dev.name()?;
-        drop(dev);
         Ok(Gpu {
             nvml,
             index,
