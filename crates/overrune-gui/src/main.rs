@@ -923,23 +923,32 @@ fn ticker(p: &Pal, s: &State, sm: &Sample) -> El {
 }
 
 fn grid_backdrop(p: &Pal) -> El {
-    // Larger than any window we expect; the root clips what overflows.
-    let (w, h) = (3840.0, 2160.0);
-    let mut shape = Shape::new();
-    let mut x = 0.0;
-    while x <= w {
-        shape = shape.stroke(vec![[x, 0.0], [x, h]], 1.0, p.grid);
-        x += 32.0;
+    // ~190 strokes: built once per thread, not on every view run.
+    thread_local! {
+        static GRID: std::cell::OnceCell<El> = const { std::cell::OnceCell::new() };
     }
-    let mut y = 0.0;
-    while y <= h {
-        shape = shape.stroke(vec![[0.0, y], [w, y]], 1.0, p.grid);
-        y += 32.0;
-    }
-    canvas(shape.view_box(w, h))
-        .size(w, h)
-        .absolute(0.0, 0.0)
-        .a11y_hidden()
+    GRID.with(|g| {
+        g.get_or_init(|| {
+            // Larger than any window we expect; the root clips what overflows.
+            let (w, h) = (3840.0, 2160.0);
+            let mut shape = Shape::new();
+            let mut x = 0.0;
+            while x <= w {
+                shape = shape.stroke(vec![[x, 0.0], [x, h]], 1.0, p.grid);
+                x += 32.0;
+            }
+            let mut y = 0.0;
+            while y <= h {
+                shape = shape.stroke(vec![[0.0, y], [w, y]], 1.0, p.grid);
+                y += 32.0;
+            }
+            canvas(shape.view_box(w, h))
+                .size(w, h)
+                .absolute(0.0, 0.0)
+                .a11y_hidden()
+        })
+        .clone()
+    })
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
