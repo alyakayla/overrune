@@ -18,6 +18,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy, llvm-tools-preview
+      # The Rune GUI links libxkbcommon.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
 
@@ -29,6 +31,7 @@ jobs:
       - run: sh -n dist/install.sh
       - name: Units and polkit action parse
         run: |
+          sudo apt-get install -y --no-install-recommends libxml2-utils
           mkdir -p /tmp/units && cp dist/*.service dist/*.socket /tmp/units/
           sed -i 's#^ExecStart=.*#ExecStart=/bin/true#' /tmp/units/*.service
           systemd-analyze verify /tmp/units/overrunerd.socket /tmp/units/*.service

@@ -1,0 +1,9 @@
+[package]
+name = "overrune-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+overrune-core = { path = "../overrune-core" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "02a284b5cc64" }
