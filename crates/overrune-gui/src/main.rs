@@ -814,7 +814,7 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
 
 fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
     let f = face(i, s, sm);
-    let on_accent = mode == Mode::Rest && i == 6;
+    let on_accent = mode != Mode::Open && i == 6;
     let (ink, sub_ink) = if on_accent {
         (p.black, p.black)
     } else {
@@ -835,11 +835,11 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
         .radius(tok::radius::SM)
         .border(1.0, if mode == Mode::Open { p.accent } else { p.edge })
         .fill(match mode {
-            Mode::Rest if i == 6 => p.accent,
-            Mode::Rest if i == 7 => p.profiles,
+            Mode::Open => p.focus,
+            _ if i == 6 => p.accent,
+            _ if i == 7 => p.profiles,
             Mode::Rest => p.glass,
             Mode::Compact => p.filled,
-            Mode::Open => p.focus,
         })
         .backdrop_blur(4.0)
         .on_press(move |s: &mut State| {
