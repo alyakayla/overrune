@@ -21,7 +21,7 @@ mod icons;
 
 const HISTORY: usize = 120;
 const DEBOUNCE_S: f64 = 0.4;
-const POLL_S: u64 = 2;
+const MAX_BACKOFF_S: u64 = 15;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the connection thread tells the window.
@@ -122,52 +122,68 @@ fn exchange(
     Ok(())
 }
 
-/// One short-lived connection: replay what the user wants if needed, then read the status.
-/// The daemon serves clients one at a time, so nothing holds the socket between rounds.
-fn round(intended: Option<&Request>, link: &Mutex<Link>) -> io::Result<()> {
-    let sock = UnixStream::connect(socket_path())?;
-    sock.set_read_timeout(Some(IO_TIMEOUT))?;
-    sock.set_write_timeout(Some(IO_TIMEOUT))?;
+/// One connected session; returns on any I/O error so the caller reconnects.
+fn session(
+    sock: UnixStream,
+    rx: &Receiver<Request>,
+    link: &Mutex<Link>,
+    wake: &Waker,
+    intended: &mut Option<Request>,
+) -> io::Result<()> {
     let mut r = BufReader::new(sock.try_clone()?);
     let mut w = sock;
-    if let Some(req) = intended {
-        exchange(&mut w, &mut r, req, link)?;
+    {
+        let mut l = link.lock().unwrap();
+        l.connected = true;
+        l.generation += 1;
+    }
+    wake();
+    // Re-send only what the user currently wants, then learn what is enforced.
+    if let Some(req) = intended.clone() {
+        exchange(&mut w, &mut r, &req, link)?;
     }
     exchange(&mut w, &mut r, &Request::Status, link)?;
-    link.lock().unwrap().connected = true;
+    wake();
+    while let Ok(req) = rx.recv() {
+        remember(req.clone(), intended);
+        exchange(&mut w, &mut r, &req, link)?;
+        exchange(&mut w, &mut r, &Request::Status, link)?;
+        wake();
+    }
     Ok(())
 }
 
+fn remember(req: Request, intended: &mut Option<Request>) {
+    match req {
+        Request::Apply(_) => *intended = Some(req),
+        Request::Reset => *intended = None,
+        _ => {}
+    }
+}
+
 fn worker(rx: Receiver<Request>, link: Arc<Mutex<Link>>, wake: Waker) {
-    // The request to replay; stays set until a round delivers it (Reset included).
-    let mut intended: Option<Request> = None;
-    let mut undelivered = false;
+    let mut intended = None;
+    let mut backoff = 1;
     loop {
-        match rx.recv_timeout(Duration::from_secs(POLL_S)) {
-            Ok(req @ (Request::Apply(_) | Request::Reset)) => {
-                intended = Some(req);
-                undelivered = true;
-            }
-            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+        if let Ok(sock) = UnixStream::connect(socket_path()) {
+            let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
+            backoff = 1;
+            let _ = session(sock, &rx, &link, &wake, &mut intended);
         }
-        let sent = if undelivered { intended.as_ref() } else { None };
-        match round(sent, &link) {
-            Ok(()) => {
-                if undelivered && matches!(intended, Some(Request::Reset)) {
-                    intended = None;
-                }
-                undelivered = false;
-            }
-            Err(_) => {
-                undelivered = intended.is_some();
-                let mut l = link.lock().unwrap();
-                l.connected = false;
-                l.status = None;
-                l.generation += 1;
-            }
+        {
+            let mut l = link.lock().unwrap();
+            l.connected = false;
+            l.status = None;
+            l.generation += 1;
         }
         wake();
+        match rx.recv_timeout(Duration::from_secs(backoff)) {
+            Ok(req) => remember(req, &mut intended),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF_S);
     }
 }
 
@@ -215,7 +231,6 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if !connected {
         s.synced = false;
-        s.dragging = false;
     } else if s.pending_since.is_none()
         && let (false, Some(e)) = (s.synced, enforcing)
     {
