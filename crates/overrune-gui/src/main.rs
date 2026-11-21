@@ -141,12 +141,14 @@ fn session(
     // Re-send only what the user currently wants, then learn what is enforced.
     if let Some(req) = intended.clone() {
         exchange(&mut w, &mut r, &req, link)?;
+        *intended = None; // acknowledged; a later status failure must not replay it
     }
     exchange(&mut w, &mut r, &Request::Status, link)?;
     wake();
     while let Ok(req) = rx.recv() {
         remember(req.clone(), intended);
         exchange(&mut w, &mut r, &req, link)?;
+        *intended = None;
         exchange(&mut w, &mut r, &Request::Status, link)?;
         wake();
     }
