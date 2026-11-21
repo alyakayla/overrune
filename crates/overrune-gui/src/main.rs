@@ -421,6 +421,7 @@ struct Pal {
     muted: Color,
     accent: Color,
     focus: Color,
+    filled: Color,
 }
 
 fn pal() -> Pal {
@@ -433,7 +434,8 @@ fn pal() -> Pal {
         ink: c("#e9edf3"),
         muted: c("#8891a1"),
         accent: c("#5ab9fc"),
-        focus: c("#5ab9fc55"),
+        focus: c("#131824EE"),
+        filled: c("#ffffff2e"),
     }
 }
 
@@ -821,24 +823,28 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
         .padding(space::S3)
         .gap(space::S2)
         .radius(tok::radius::SM)
-        .border(1.0, p.edge)
-        .fill(if mode == Mode::Open { p.focus } else { p.glass })
+        .border(1.0, if mode == Mode::Open { p.accent } else { p.edge })
+        .fill(match mode {
+            Mode::Rest => p.glass,
+            Mode::Compact => p.filled,
+            Mode::Open => p.focus,
+        })
         .backdrop_blur(4.0)
         .on_press(move |s: &mut State| {
             s.open = if s.open == Some(i) { None } else { Some(i) };
         })
         .child(text(f.label).font(type_::SECTION).color(sub_ink));
     match mode {
-        Mode::Rest => {
+        Mode::Rest | Mode::Compact => {
+            let big = if mode == Mode::Rest {
+                BIG
+            } else {
+                type_::TITLE
+            };
             el_ = el_
                 .child(el().grow(1.0))
                 .child(icon(i, ink))
-                .child(text(f.big).font(BIG.mono()).color(ink))
-                .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink));
-        }
-        Mode::Compact => {
-            el_ = el_
-                .child(text(f.big).font(type_::TITLE.mono()).color(ink))
+                .child(text(f.big).font(big.mono()).color(ink))
                 .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink));
         }
         Mode::Open => {
