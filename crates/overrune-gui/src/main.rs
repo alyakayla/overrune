@@ -791,14 +791,6 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
         .border(1.0, p.edge)
         .fill(if accent_tile { p.accent } else { p.glass })
         .backdrop_blur(14.0)
-        .hover_delays(Duration::from_millis(140), Duration::ZERO)
-        .on_hover_change(move |s: &mut State, hovered, _tx: &mut Tx| {
-            // Hover only opens from rest: once open the layout moves under the
-            // pointer, so switching tiles is a click.
-            if hovered && s.open.is_none() {
-                s.open = Some(i);
-            }
-        })
         .on_press(move |s: &mut State| {
             s.open = if s.open == Some(i) { None } else { Some(i) };
         })
