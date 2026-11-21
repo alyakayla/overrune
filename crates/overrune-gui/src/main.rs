@@ -21,7 +21,8 @@ mod icons;
 
 const HISTORY: usize = 120;
 const DEBOUNCE_S: f64 = 0.4;
-const MAX_BACKOFF_S: u64 = 15;
+const POLL_S: u64 = 2;
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the connection thread tells the window.
 #[derive(Default)]
@@ -56,7 +57,11 @@ struct State {
 
 impl State {
     fn new() -> State {
-        let gpu = Gpu::open();
+        // Same device choice as the daemon, so readings and tuning hit one GPU.
+        let gpu = match std::env::var("OVERRUNE_BUS_ID") {
+            Ok(id) => Gpu::open_by_bus_id(&id),
+            Err(_) => Gpu::open(),
+        };
         let (caps, error) = match gpu.as_ref().map(Gpu::capabilities) {
             Ok(Ok(c)) => (Some(c), None),
             Ok(Err(e)) => (None, Some(e.to_string())),
@@ -117,66 +122,52 @@ fn exchange(
     Ok(())
 }
 
-/// One connected session; returns on any I/O error so the caller reconnects.
-fn session(
-    sock: UnixStream,
-    rx: &Receiver<Request>,
-    link: &Mutex<Link>,
-    wake: &Waker,
-    intended: &mut Option<Request>,
-) -> io::Result<()> {
+/// One short-lived connection: replay what the user wants if needed, then read the status.
+/// The daemon serves clients one at a time, so nothing holds the socket between rounds.
+fn round(intended: Option<&Request>, link: &Mutex<Link>) -> io::Result<()> {
+    let sock = UnixStream::connect(socket_path())?;
+    sock.set_read_timeout(Some(IO_TIMEOUT))?;
+    sock.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut r = BufReader::new(sock.try_clone()?);
     let mut w = sock;
-    {
-        let mut l = link.lock().unwrap();
-        l.connected = true;
-        l.generation += 1;
-    }
-    wake();
-    // Re-send only what the user currently wants, then learn what is enforced.
-    if let Some(req) = intended.clone() {
-        exchange(&mut w, &mut r, &req, link)?;
+    if let Some(req) = intended {
+        exchange(&mut w, &mut r, req, link)?;
     }
     exchange(&mut w, &mut r, &Request::Status, link)?;
-    wake();
-    while let Ok(req) = rx.recv() {
-        remember(req.clone(), intended);
-        exchange(&mut w, &mut r, &req, link)?;
-        exchange(&mut w, &mut r, &Request::Status, link)?;
-        wake();
-    }
+    link.lock().unwrap().connected = true;
     Ok(())
 }
 
-fn remember(req: Request, intended: &mut Option<Request>) {
-    match req {
-        Request::Apply(_) => *intended = Some(req),
-        Request::Reset => *intended = None,
-        _ => {}
-    }
-}
-
 fn worker(rx: Receiver<Request>, link: Arc<Mutex<Link>>, wake: Waker) {
-    let mut intended = None;
-    let mut backoff = 1;
+    // The request to replay; stays set until a round delivers it (Reset included).
+    let mut intended: Option<Request> = None;
+    let mut undelivered = false;
     loop {
-        if let Ok(sock) = UnixStream::connect(socket_path()) {
-            backoff = 1;
-            let _ = session(sock, &rx, &link, &wake, &mut intended);
-        }
-        {
-            let mut l = link.lock().unwrap();
-            l.connected = false;
-            l.status = None;
-            l.generation += 1;
-        }
-        wake();
-        match rx.recv_timeout(Duration::from_secs(backoff)) {
-            Ok(req) => remember(req, &mut intended),
-            Err(RecvTimeoutError::Timeout) => {}
+        match rx.recv_timeout(Duration::from_secs(POLL_S)) {
+            Ok(req @ (Request::Apply(_) | Request::Reset)) => {
+                intended = Some(req);
+                undelivered = true;
+            }
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF_S);
+        let sent = if undelivered { intended.as_ref() } else { None };
+        match round(sent, &link) {
+            Ok(()) => {
+                if undelivered && matches!(intended, Some(Request::Reset)) {
+                    intended = None;
+                }
+                undelivered = false;
+            }
+            Err(_) => {
+                undelivered = intended.is_some();
+                let mut l = link.lock().unwrap();
+                l.connected = false;
+                l.status = None;
+                l.generation += 1;
+            }
+        }
+        wake();
     }
 }
 
@@ -201,7 +192,11 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     s.sample = Some(sm);
                     s.error = None;
                 }
-                Err(e) => s.error = Some(e.to_string()),
+                Err(e) => {
+                    // Don't keep presenting the last reading as live.
+                    s.sample = None;
+                    s.error = Some(e.to_string());
+                }
             }
             changed = true;
         }
@@ -220,7 +215,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if !connected {
         s.synced = false;
-    } else if let (false, Some(e)) = (s.synced, enforcing) {
+        s.dragging = false;
+    } else if s.pending_since.is_none()
+        && let (false, Some(e)) = (s.synced, enforcing)
+    {
         s.synced = true;
         s.edits = e;
     }
@@ -292,7 +290,7 @@ fn set_knob(edits: &mut ProfileSettings, caps: &Capabilities, k: Knob, v: f32) {
     match k {
         Knob::Core => edits.core_offset_mhz = Some(v.round() as i32),
         Knob::Mem => edits.mem_offset_mhz = Some(v.round() as i32),
-        Knob::Power => edits.power_limit_w = Some(v.round()),
+        Knob::Power => edits.power_limit_w = Some(v.round().clamp(lo, hi)),
         Knob::Ceiling => edits.lock_max_clock_mhz = Some(caps.snap_clock(v.round() as u32)),
     }
 }
@@ -338,7 +336,21 @@ fn slider(
                 .a11y_value(format!("{v:.0} {unit}"))
                 .on_step(move |s: &mut State, steps, tx| {
                     let cur = current(s, k);
-                    set_knob(&mut s.edits, &caps_for_step, k, cur + steps as f32 * step);
+                    let target = if k == Knob::Ceiling {
+                        // Move by supported clocks, not a fixed MHz step that snaps back.
+                        let mut c = caps_for_step.graphics_clocks_mhz.clone();
+                        c.sort_unstable();
+                        let at = c
+                            .iter()
+                            .position(|&m| m == caps_for_step.snap_clock(cur as u32));
+                        at.map_or(cur, |i| {
+                            c[(i as i64 + i64::from(steps)).clamp(0, c.len() as i64 - 1) as usize]
+                                as f32
+                        })
+                    } else {
+                        cur + steps as f32 * step
+                    };
+                    set_knob(&mut s.edits, &caps_for_step, k, target);
                     s.pending_since = Some(tx.clock());
                     tx.wake_after(Duration::from_secs_f64(DEBOUNCE_S + 0.05));
                 })
