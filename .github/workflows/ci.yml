@@ -29,6 +29,7 @@ jobs:
 
       # The shipped units and polkit action are never exercised by cargo.
       - run: sh -n dist/install.sh
+      - run: sh -n dist/uninstall.sh
       - name: Units and polkit action parse
         run: |
           sudo apt-get install -y --no-install-recommends libxml2-utils
