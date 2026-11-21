@@ -562,7 +562,22 @@ fn line_graph(p: &Pal, key: &'static str, data: &[f32], max: f32) -> El {
         .map(|(i, x)| [i as f32 * 4.0, h - (x / max.max(1.0)).clamp(0.0, 1.0) * h])
         .collect();
     let mut shape = Shape::new();
+    for k in 0..=4 {
+        let y = h * k as f32 / 4.0;
+        shape = shape.line([0.0, y], [w, y], 1.0, LineCap::Butt, p.edge);
+    }
     if pts.len() > 1 {
+        // Faded area: stacked bands, each clipped to the line, brighter near it.
+        const BANDS: usize = 6;
+        for b in 0..BANDS {
+            let (top, bot) = (b as f32 / BANDS as f32, (b + 1) as f32 / BANDS as f32);
+            let mut poly: Vec<[f32; 2]> = pts
+                .iter()
+                .map(|q| [q[0], q[1] + top * (h - q[1])])
+                .collect();
+            poly.extend(pts.iter().rev().map(|q| [q[0], q[1] + bot * (h - q[1])]));
+            shape = shape.fill(poly, p.accent.alpha(0.22 * (1.0 - top)));
+        }
         shape = shape.stroke_with(pts, false, 1.5, LineCap::Round, p.accent);
     }
     canvas(shape.view_box(w, h))
