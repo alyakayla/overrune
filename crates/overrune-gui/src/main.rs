@@ -435,7 +435,7 @@ fn pal() -> Pal {
         muted: c("#8891a1"),
         accent: c("#5ab9fc"),
         focus: c("#131824EE"),
-        filled: c("#ffffff2e"),
+        filled: c("#ffffff0a"),
     }
 }
 
@@ -464,7 +464,7 @@ fn icon_rects(i: usize) -> &'static [[f32; 4]] {
     &CACHE[i]
 }
 
-fn icon(i: usize, color: Color) -> El {
+fn icon(i: usize, color: Color, size: f32) -> El {
     let mut shape = Shape::new();
     for [x, y, w, h] in icon_rects(i) {
         shape = shape.fill(
@@ -473,7 +473,7 @@ fn icon(i: usize, color: Color) -> El {
         );
     }
     canvas(shape.view_box(96.0, 96.0))
-        .size(96.0, 96.0)
+        .size(size, size)
         .a11y_hidden()
 }
 
@@ -843,7 +843,7 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
             };
             el_ = el_
                 .child(el().grow(1.0))
-                .child(icon(i, ink))
+                .child(icon(i, ink, if mode == Mode::Rest { 128.0 } else { 96.0 }))
                 .child(text(f.big).font(big.mono()).color(ink))
                 .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink));
         }
@@ -858,7 +858,7 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
                         .child(if i == 3 {
                             ring(p, sm.util_gpu_pct as f32)
                         } else {
-                            icon(i, ink)
+                            icon(i, ink, 128.0)
                         })
                         .child(text(f.big).font(BIG.mono()).color(ink))
                         .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink)),
