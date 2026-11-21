@@ -475,6 +475,29 @@ fn icon(i: usize, color: Color) -> El {
         .a11y_hidden()
 }
 
+/// Circular gauge: a faint track and an accent arc for `pct` percent.
+fn ring(p: &Pal, pct: f32) -> El {
+    let (c, r) = (48.0_f32, 40.0_f32);
+    let arc = |frac: f32| -> Vec<[f32; 2]> {
+        let n = ((frac * 64.0).ceil() as usize).max(1);
+        (0..=n)
+            .map(|k| {
+                let a = -std::f32::consts::FRAC_PI_2
+                    + std::f32::consts::TAU * frac * k as f32 / n as f32;
+                [c + r * a.cos(), c + r * a.sin()]
+            })
+            .collect()
+    };
+    let frac = (pct / 100.0).clamp(0.0, 1.0);
+    let mut shape = Shape::new().stroke_with(arc(1.0), true, 6.0, LineCap::Butt, p.edge);
+    if frac > 0.0 {
+        shape = shape.stroke_with(arc(frac), false, 6.0, LineCap::Round, p.accent);
+    }
+    canvas(shape.view_box(96.0, 96.0))
+        .size(96.0, 96.0)
+        .a11y_hidden()
+}
+
 struct Face {
     label: &'static str,
     big: String,
@@ -831,6 +854,11 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
                     row()
                         .gap(space::S3)
                         .center_y()
+                        .child(if i == 3 {
+                            ring(p, sm.util_gpu_pct as f32)
+                        } else {
+                            icon(i, ink)
+                        })
                         .child(text(f.big).font(BIG.mono()).color(ink))
                         .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink)),
                 )
