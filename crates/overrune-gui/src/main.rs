@@ -880,7 +880,8 @@ fn ticker(p: &Pal, s: &State, sm: &Sample) -> El {
 }
 
 fn grid_backdrop(p: &Pal) -> El {
-    let (w, h) = (1600.0, 1000.0);
+    // Larger than any window we expect; the root clips what overflows.
+    let (w, h) = (3840.0, 2160.0);
     let mut shape = Shape::new();
     let mut x = 0.0;
     while x <= w {
@@ -906,7 +907,8 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .key("root")
         .padding(space::S3)
         .gap(space::S3)
-        .fill(p.ground);
+        .fill(p.ground)
+        .clip_rounded(0.0);
 
     let Some(sm) = &s.sample else {
         let msg = s.error.clone().unwrap_or_else(|| "Reading the GPU…".into());
