@@ -421,6 +421,8 @@ struct Pal {
     muted: Color,
     accent: Color,
     focus: Color,
+    profiles: Color,
+    black: Color,
     filled: Color,
 }
 
@@ -435,6 +437,8 @@ fn pal() -> Pal {
         muted: c("#8891a1"),
         accent: c("#5ab9fc"),
         focus: c("#131824EE"),
+        profiles: c("#232c40"),
+        black: c("#000000"),
         filled: c("#ffffff0a"),
     }
 }
@@ -810,7 +814,13 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
 
 fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
     let f = face(i, s, sm);
-    let (ink, sub_ink) = (p.ink, p.muted);
+    let on_accent = mode == Mode::Rest && i == 6;
+    let (ink, sub_ink) = if on_accent {
+        (p.black, p.black)
+    } else {
+        (p.ink, p.muted)
+    };
+    let icon_ink = if mode == Mode::Open { p.accent } else { ink };
     let id = format!("tile-{i}");
     let mut el_ = col()
         .key(id.clone())
@@ -825,6 +835,8 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
         .radius(tok::radius::SM)
         .border(1.0, if mode == Mode::Open { p.accent } else { p.edge })
         .fill(match mode {
+            Mode::Rest if i == 6 => p.accent,
+            Mode::Rest if i == 7 => p.profiles,
             Mode::Rest => p.glass,
             Mode::Compact => p.filled,
             Mode::Open => p.focus,
@@ -843,7 +855,11 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
             };
             el_ = el_
                 .child(el().grow(1.0))
-                .child(icon(i, ink, if mode == Mode::Rest { 128.0 } else { 96.0 }))
+                .child(icon(
+                    i,
+                    icon_ink,
+                    if mode == Mode::Rest { 128.0 } else { 96.0 },
+                ))
                 .child(text(f.big).font(big.mono()).color(ink))
                 .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink));
         }
@@ -858,7 +874,7 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
                         .child(if i == 3 {
                             ring(p, sm.util_gpu_pct as f32)
                         } else {
-                            icon(i, ink, 128.0)
+                            icon(i, icon_ink, 128.0)
                         })
                         .child(text(f.big).font(BIG.mono()).color(ink))
                         .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink)),
