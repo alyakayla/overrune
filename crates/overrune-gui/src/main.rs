@@ -411,7 +411,7 @@ fn reset_button(t: tok::Theme) -> El {
 
 // ---- view ----
 
-/// The Paper design's night-and-sky-blue palette.
+/// The Paper design's night-and-sky-blue paletdte.
 struct Pal {
     ground: Color,
     glass: Color,
@@ -420,7 +420,7 @@ struct Pal {
     ink: Color,
     muted: Color,
     accent: Color,
-    on_accent: Color,
+    focus: Color,
 }
 
 fn pal() -> Pal {
@@ -433,7 +433,7 @@ fn pal() -> Pal {
         ink: c("#e9edf3"),
         muted: c("#8891a1"),
         accent: c("#5ab9fc"),
-        on_accent: c("#0a0d14"),
+        focus: c("#5ab9fc55"),
     }
 }
 
@@ -808,12 +808,7 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
 
 fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
     let f = face(i, s, sm);
-    let accent_tile = i == 6;
-    let (ink, sub_ink) = if accent_tile {
-        (p.on_accent, p.on_accent)
-    } else {
-        (p.ink, p.muted)
-    };
+    let (ink, sub_ink) = (p.ink, p.muted);
     let id = format!("tile-{i}");
     let mut el_ = col()
         .key(id.clone())
@@ -827,8 +822,8 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
         .gap(space::S2)
         .radius(tok::radius::SM)
         .border(1.0, p.edge)
-        .fill(if accent_tile { p.accent } else { p.glass })
-        .backdrop_blur(8.0)
+        .fill(if mode == Mode::Open { p.focus } else { p.glass })
+        .backdrop_blur(4.0)
         .on_press(move |s: &mut State| {
             s.open = if s.open == Some(i) { None } else { Some(i) };
         })
