@@ -4,7 +4,7 @@
 use std::io::{self, BufReader};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use overrune_core::caps::Capabilities;
@@ -13,8 +13,11 @@ use overrune_core::ipc::{DaemonStatus, Request, Response, read_msg, socket_path,
 use overrune_core::profile::ProfileSettings;
 use rune::tok::{self, space, type_};
 use rune::{
-    AppSpec, Color, Cx, Drag, El, LineCap, Phase, Shape, Tx, Waker, canvas, col, el, row, text,
+    AppSpec, Color, Cx, Drag, El, LineCap, Phase, Shape, TextStyle, Tx, Waker, canvas, col, el,
+    row, text,
 };
+
+mod icons;
 
 const HISTORY: usize = 120;
 const DEBOUNCE_S: f64 = 0.4;
@@ -47,6 +50,8 @@ struct State {
     worker_rx: Option<Receiver<Request>>,
     link: Arc<Mutex<Link>>,
     seen_generation: u64,
+    /// The tile currently expanded, if any.
+    open: Option<usize>,
 }
 
 impl State {
@@ -74,6 +79,7 @@ impl State {
             worker_rx: Some(rx),
             link: Arc::default(),
             seen_generation: 0,
+            open: None,
         }
     }
 
@@ -405,223 +411,548 @@ fn reset_button(t: tok::Theme) -> El {
 
 // ---- view ----
 
-fn stat(t: tok::Theme, key: &'static str, label: &'static str, value: String) -> El {
-    col()
-        .key(key)
-        .gap(2.0)
-        .child(text(label).font(type_::SECTION).color(t.text_secondary))
-        .child(text(value).font(type_::TITLE.mono()).color(t.text))
+/// The Paper design's night-and-sky-blue palette.
+struct Pal {
+    ground: Color,
+    glass: Color,
+    edge: Color,
+    grid: Color,
+    ink: Color,
+    muted: Color,
+    accent: Color,
+    on_accent: Color,
 }
 
-fn graph(t: tok::Theme, accent: Color, s: &State, limit_w: f32) -> El {
-    let (w, h) = (HISTORY as f32 * 3.0, 100.0);
-    let pts = |v: &[f32], max: f32| -> Vec<[f32; 2]> {
-        v.iter()
-            .enumerate()
-            .map(|(i, x)| [i as f32 * 3.0, h - (x / max).clamp(0.0, 1.0) * h])
-            .collect()
-    };
-    let mut shape = Shape::new();
-    if s.temps.len() > 1 {
-        shape = shape
-            .stroke_with(pts(&s.temps, 100.0), false, 1.5, LineCap::Round, accent)
-            .stroke_with(
-                pts(&s.powers, limit_w.max(1.0)),
-                false,
-                1.5,
-                LineCap::Round,
-                Color {
-                    r: 1.0,
-                    g: 0.55,
-                    b: 0.3,
-                    a: 1.0,
-                },
-            );
+fn pal() -> Pal {
+    let c = |h| rune::color::hex(h).expect("valid palette hex");
+    Pal {
+        ground: c("#0a0d14"),
+        glass: c("#ffffff0d"),
+        edge: c("#ffffff1a"),
+        grid: c("#5ab9fc0d"),
+        ink: c("#e9edf3"),
+        muted: c("#8891a1"),
+        accent: c("#5ab9fc"),
+        on_accent: c("#0a0d14"),
     }
-    col()
+}
+
+const TILES: usize = 8;
+const BIG: TextStyle = TextStyle::new(40.0, 500.0);
+
+/// Icon pixel runs parsed once: each `M x y h w v h h -w z` becomes `[x, y, w, h]`.
+fn icon_rects(i: usize) -> &'static [[f32; 4]] {
+    static CACHE: LazyLock<Vec<Vec<[f32; 4]>>> = LazyLock::new(|| {
+        icons::ALL
+            .iter()
+            .map(|d| {
+                d.split('M')
+                    .filter_map(|run| {
+                        let n: Vec<f32> = run
+                            .split(|c: char| !(c.is_ascii_digit() || c == '-' || c == '.'))
+                            .filter_map(|t| t.parse().ok())
+                            .collect();
+                        // x y w h (the `h`/`v` numbers are width and height)
+                        (n.len() >= 4).then(|| [n[0], n[1], n[2], n[3]])
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+    &CACHE[i]
+}
+
+fn icon(i: usize, color: Color) -> El {
+    let mut shape = Shape::new();
+    for [x, y, w, h] in icon_rects(i) {
+        shape = shape.fill(
+            vec![[*x, *y], [x + w, *y], [x + w, y + h], [*x, y + h]],
+            color,
+        );
+    }
+    canvas(shape.view_box(96.0, 96.0))
+        .size(96.0, 96.0)
+        .a11y_hidden()
+}
+
+struct Face {
+    label: &'static str,
+    big: String,
+    sub: String,
+}
+
+fn face(i: usize, s: &State, sm: &Sample) -> Face {
+    let link = s.link.lock().unwrap();
+    let enforcing = link.status.as_ref().map(|st| &st.enforcing);
+    let ceiling = link
+        .status
+        .as_ref()
+        .and_then(|st| st.curve_ceiling_mhz)
+        .or(enforcing.and_then(|e| e.lock_max_clock_mhz));
+    let (label, big, sub) = match i {
+        0 => ("GPU TEMP", format!("{}°C", sm.temp_c), "now".to_string()),
+        1 => (
+            "POWER",
+            format!("{:.0} W", sm.power_w),
+            format!("/ {:.0} W", sm.power_limit_w),
+        ),
+        2 => (
+            "CLOCKS",
+            format!("{}", sm.core_clock_mhz),
+            format!("MHz core · {} mem", sm.mem_clock_mhz),
+        ),
+        3 => (
+            "UTILIZATION",
+            format!("{}%", sm.util_gpu_pct),
+            format!("GPU · {}% MEM", sm.util_mem_pct),
+        ),
+        4 => (
+            "TEMP → CEILING",
+            ceiling.map_or("—".into(), |c| c.to_string()),
+            "MHz ceiling".to_string(),
+        ),
+        5 => (
+            "TUNING",
+            format!("{:+}", sm.core_offset_mhz),
+            "core MHz".to_string(),
+        ),
+        6 => (
+            "ENFORCED NOW",
+            link.status
+                .as_ref()
+                .and_then(|st| st.active_profile.clone())
+                .unwrap_or_else(|| "default".into()),
+            format!(
+                "P{} · {}",
+                sm.pstate,
+                if link.connected {
+                    "daemon ok"
+                } else {
+                    "no daemon"
+                }
+            ),
+        ),
+        _ => (
+            "PROFILES",
+            link.status
+                .as_ref()
+                .and_then(|st| st.active_profile.clone())
+                .unwrap_or_else(|| "none".into()),
+            "active".to_string(),
+        ),
+    };
+    Face { label, big, sub }
+}
+
+fn kv(p: &Pal, key: &'static str, label: &'static str, value: String) -> El {
+    row()
+        .key(key)
+        .justify_between()
+        .py(space::S2)
+        .border_sides([0.0, 0.0, 0.0, 1.0], p.edge)
+        .child(text(label).font(type_::SECTION).color(p.muted))
+        .child(text(value).font(type_::BODY.mono()).color(p.ink))
+}
+
+fn line_graph(p: &Pal, key: &'static str, data: &[f32], max: f32) -> El {
+    let (w, h) = (HISTORY as f32 * 4.0, 120.0);
+    let pts: Vec<[f32; 2]> = data
+        .iter()
+        .enumerate()
+        .map(|(i, x)| [i as f32 * 4.0, h - (x / max.max(1.0)).clamp(0.0, 1.0) * h])
+        .collect();
+    let mut shape = Shape::new();
+    if pts.len() > 1 {
+        shape = shape.stroke_with(pts, false, 1.5, LineCap::Round, p.accent);
+    }
+    canvas(shape.view_box(w, h))
+        .key(key)
+        .size(w, h)
+        .radius(tok::radius::SM)
+}
+
+/// The extra rows and widgets an expanded tile shows.
+fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
+    let peak = |v: &[f32]| v.iter().copied().fold(0.0, f32::max);
+    let throttle = if sm.throttle_reasons.is_empty() {
+        "none".to_string()
+    } else {
+        sm.throttle_reasons.join(", ")
+    };
+    let mut c = col().gap(space::S2);
+    match i {
+        0 => {
+            c = c
+                .child(line_graph(p, "graph-temp", &s.temps, 100.0))
+                .child(kv(p, "x-now", "NOW", format!("{} °C", sm.temp_c)))
+                .child(kv(p, "x-peak", "PEAK", format!("{:.0} °C", peak(&s.temps))))
+                .child(kv(p, "x-throttle", "THROTTLE", throttle));
+        }
+        1 => {
+            c = c
+                .child(line_graph(p, "graph-power", &s.powers, sm.power_limit_w))
+                .child(kv(p, "x-draw", "DRAW", format!("{:.0} W", sm.power_w)))
+                .child(kv(
+                    p,
+                    "x-limit",
+                    "ENFORCED LIMIT",
+                    format!("{:.0} W", sm.power_limit_w),
+                ))
+                .child(kv(p, "x-peak", "PEAK", format!("{:.0} W", peak(&s.powers))))
+                .child(kv(p, "x-throttle", "THROTTLE", throttle));
+        }
+        2 => {
+            c = c
+                .child(kv(
+                    p,
+                    "x-core",
+                    "CORE",
+                    format!("{} MHz", sm.core_clock_mhz),
+                ))
+                .child(kv(
+                    p,
+                    "x-mem",
+                    "MEMORY",
+                    format!("{} MHz", sm.mem_clock_mhz),
+                ))
+                .child(kv(
+                    p,
+                    "x-coff",
+                    "CORE OFFSET",
+                    format!("{:+} MHz", sm.core_offset_mhz),
+                ))
+                .child(kv(
+                    p,
+                    "x-moff",
+                    "MEMORY OFFSET",
+                    format!("{:+} MHz", sm.mem_offset_mhz),
+                ))
+                .child(kv(p, "x-pstate", "P-STATE", format!("P{}", sm.pstate)));
+        }
+        3 => {
+            c = c
+                .child(kv(p, "x-gpu", "GPU", format!("{}%", sm.util_gpu_pct)))
+                .child(kv(
+                    p,
+                    "x-memu",
+                    "MEMORY BUS",
+                    format!("{}%", sm.util_mem_pct),
+                ))
+                .child(kv(
+                    p,
+                    "x-vram",
+                    "VRAM",
+                    format!("{} / {} MiB", sm.vram_used_mb, sm.vram_total_mb),
+                ));
+        }
+        4 => {
+            let link = s.link.lock().unwrap();
+            let ceil = link.status.as_ref().and_then(|st| st.curve_ceiling_mhz);
+            c = c
+                .child(kv(p, "x-temp", "TEMPERATURE", format!("{} °C", sm.temp_c)))
+                .child(kv(
+                    p,
+                    "x-ceil",
+                    "CURVE CEILING",
+                    ceil.map_or("no curve active".into(), |m| format!("{m} MHz")),
+                ))
+                .child(kv(
+                    p,
+                    "x-core",
+                    "CORE CLOCK",
+                    format!("{} MHz", sm.core_clock_mhz),
+                ));
+        }
+        5 => {
+            if s.caps.is_some() && s.connected() {
+                let link_msg = s.link.lock().unwrap().message.clone();
+                c = c
+                    .child(slider(
+                        t,
+                        p.accent,
+                        "core-offset",
+                        "Core offset",
+                        "MHz",
+                        Knob::Core,
+                        s,
+                    ))
+                    .child(slider(
+                        t,
+                        p.accent,
+                        "mem-offset",
+                        "Memory offset",
+                        "MHz",
+                        Knob::Mem,
+                        s,
+                    ))
+                    .child(slider(
+                        t,
+                        p.accent,
+                        "power-limit",
+                        "Power limit",
+                        "W",
+                        Knob::Power,
+                        s,
+                    ))
+                    .child(slider(
+                        t,
+                        p.accent,
+                        "lock-ceiling",
+                        "Clock ceiling",
+                        "MHz",
+                        Knob::Ceiling,
+                        s,
+                    ))
+                    .child(
+                        row()
+                            .gap(space::S3)
+                            .center_y()
+                            .child(reset_button(t))
+                            .child(
+                                text(link_msg)
+                                    .key("message")
+                                    .font(type_::LABEL)
+                                    .color(p.muted),
+                            ),
+                    );
+            } else {
+                c = c.child(
+                    text("overrunerd is not reachable: showing read-only metrics. Reconnecting…")
+                        .key("tuning-unavailable")
+                        .font(type_::LABEL)
+                        .color(p.muted),
+                );
+            }
+        }
+        _ => {
+            let link = s.link.lock().unwrap();
+            if let Some(st) = &link.status {
+                let e = &st.enforcing;
+                let show = |v: Option<String>| v.unwrap_or_else(|| "default".into());
+                c = c
+                    .child(kv(p, "x-prof", "PROFILE", show(st.active_profile.clone())))
+                    .child(kv(
+                        p,
+                        "x-ecore",
+                        "CORE OFFSET",
+                        show(e.core_offset_mhz.map(|v| format!("{v:+} MHz"))),
+                    ))
+                    .child(kv(
+                        p,
+                        "x-emem",
+                        "MEMORY OFFSET",
+                        show(e.mem_offset_mhz.map(|v| format!("{v:+} MHz"))),
+                    ))
+                    .child(kv(
+                        p,
+                        "x-epow",
+                        "POWER LIMIT",
+                        show(e.power_limit_w.map(|v| format!("{v:.0} W"))),
+                    ))
+                    .child(kv(
+                        p,
+                        "x-elock",
+                        "CLOCK CEILING",
+                        show(e.lock_max_clock_mhz.map(|v| format!("{v} MHz"))),
+                    ));
+            } else {
+                c = c.child(
+                    text("No daemon: nothing is being enforced.")
+                        .key("enforced-none")
+                        .font(type_::LABEL)
+                        .color(p.muted),
+                );
+            }
+        }
+    }
+    c
+}
+
+fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
+    let f = face(i, s, sm);
+    let accent_tile = i == 6;
+    let (ink, sub_ink) = if accent_tile {
+        (p.on_accent, p.on_accent)
+    } else {
+        (p.ink, p.muted)
+    };
+    let id = format!("tile-{i}");
+    let mut el_ = col()
+        .key(id.clone())
+        .matched(id)
+        .role("button")
+        .label(f.label)
+        .focusable(true)
+        .w(10.0)
+        .grow(1.0)
+        .padding(space::S3)
         .gap(space::S2)
-        .child(
-            row()
-                .gap(space::S3)
+        .radius(tok::radius::SM)
+        .border(1.0, p.edge)
+        .fill(if accent_tile { p.accent } else { p.glass })
+        .backdrop_blur(14.0)
+        .hover_delays(Duration::from_millis(140), Duration::ZERO)
+        .on_hover_change(move |s: &mut State, hovered, _tx: &mut Tx| {
+            // Hover only opens from rest: once open the layout moves under the
+            // pointer, so switching tiles is a click.
+            if hovered && s.open.is_none() {
+                s.open = Some(i);
+            }
+        })
+        .on_press(move |s: &mut State| {
+            s.open = if s.open == Some(i) { None } else { Some(i) };
+        })
+        .child(text(f.label).font(type_::SECTION).color(sub_ink));
+    match mode {
+        Mode::Rest => {
+            el_ = el_
+                .child(el().grow(1.0))
+                .child(icon(i, ink))
+                .child(text(f.big).font(BIG.mono()).color(ink))
+                .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink));
+        }
+        Mode::Compact => {
+            el_ = el_
+                .child(text(f.big).font(type_::TITLE.mono()).color(ink))
+                .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink));
+        }
+        Mode::Open => {
+            el_ = el_
+                .grow(2.0)
+                .padding(space::S6)
                 .child(
-                    text("Temperature 0–100 °C")
-                        .font(type_::LABEL)
-                        .color(accent),
+                    row()
+                        .gap(space::S3)
+                        .center_y()
+                        .child(text(f.big).font(BIG.mono()).color(ink))
+                        .child(text(f.sub).font(type_::LABEL.mono()).color(sub_ink)),
                 )
-                .child(
-                    text(format!("Power 0–{limit_w:.0} W"))
-                        .font(type_::LABEL)
-                        .color(Color {
-                            r: 1.0,
-                            g: 0.55,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                ),
-        )
-        .child(
-            canvas(shape.view_box(w, h))
-                .key("graph")
-                .size(w, h)
-                .fill(t.card)
-                .radius(tok::radius::MD),
-        )
+                .child(body(i, p, t, s, sm));
+        }
+    }
+    el_
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Rest,
+    Compact,
+    Open,
+}
+
+fn ticker(p: &Pal, s: &State, sm: &Sample) -> El {
+    let item = |key: &'static str, label: &'static str, v: String| {
+        col()
+            .key(key)
+            .child(text(label).font(type_::SECTION).color(p.muted))
+            .child(text(v).font(type_::LABEL.mono()).color(p.ink))
+    };
+    let mut r = row()
+        .gap(space::S6)
+        .center_y()
+        .padding(space::S3)
+        .radius(tok::radius::SM)
+        .border(1.0, p.edge)
+        .fill(p.glass)
+        .child(text("OVERRUNE").font(type_::TITLE.mono()).color(p.ink))
+        .child(item("temp", "TEMP", format!("{}°C", sm.temp_c)))
+        .child(item("core", "CORE", format!("{} MHz", sm.core_clock_mhz)))
+        .child(item("mem", "MEM", format!("{} MHz", sm.mem_clock_mhz)))
+        .child(item(
+            "power",
+            "POWER",
+            format!("{:.0} / {:.0} W", sm.power_w, sm.power_limit_w),
+        ))
+        .child(item("util", "UTIL", format!("{}%", sm.util_gpu_pct)))
+        .child(item("pstate", "PSTATE", format!("P{}", sm.pstate)))
+        .child(item(
+            "vram",
+            "VRAM",
+            format!("{} / {} MB", sm.vram_used_mb, sm.vram_total_mb),
+        ));
+    if let (Some(f), true) = (sm.fan_pct, s.caps.as_ref().is_some_and(|c| c.num_fans > 0)) {
+        r = r.child(item("fan", "FAN", format!("{f}%")));
+    }
+    let status = if s.connected() {
+        text("● daemon")
+            .key("daemon")
+            .font(type_::LABEL.mono())
+            .color(p.accent)
+    } else {
+        text("● read-only")
+            .key("read-only")
+            .font(type_::LABEL.mono())
+            .color(p.muted)
+    };
+    r.child(el().grow(1.0)).child(status)
+}
+
+fn grid_backdrop(p: &Pal) -> El {
+    let (w, h) = (1600.0, 1000.0);
+    let mut shape = Shape::new();
+    let mut x = 0.0;
+    while x <= w {
+        shape = shape.stroke(vec![[x, 0.0], [x, h]], 1.0, p.grid);
+        x += 32.0;
+    }
+    let mut y = 0.0;
+    while y <= h {
+        shape = shape.stroke(vec![[0.0, y], [w, y]], 1.0, p.grid);
+        y += 32.0;
+    }
+    canvas(shape.view_box(w, h))
+        .size(w, h)
+        .absolute(0.0, 0.0)
+        .a11y_hidden()
 }
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let t = tok::theme(cx.system_dark());
-    let accent = tok::accent(0, cx.system_dark());
-    let mut root = col()
+    let t = tok::theme(true);
+    let p = pal();
+    let _ = cx;
+    let root = col()
         .key("root")
-        .padding(space::S6)
+        .padding(space::S3)
         .gap(space::S3)
-        .fill(t.bg);
+        .fill(p.ground);
 
     let Some(sm) = &s.sample else {
         let msg = s.error.clone().unwrap_or_else(|| "Reading the GPU…".into());
         return root
-            .child(text("overrune").font(type_::TITLE).color(t.text))
-            .child(text(msg).key("error").color(t.text_secondary));
+            .child(text("overrune").font(type_::TITLE).color(p.ink))
+            .child(text(msg).key("error").color(p.muted));
     };
-    root = root
-        .child(
-            text(sm.name.clone())
-                .key("name")
-                .font(type_::TITLE)
-                .color(t.text),
-        )
-        .child(
-            text(format!("driver {} · {}", sm.driver_version, sm.bus_id))
-                .font(type_::LABEL)
-                .color(t.text_secondary),
-        )
-        .child(
-            row()
-                .gap(space::S6)
-                .child(stat(t, "temp", "Temperature", format!("{} °C", sm.temp_c)))
-                .child(stat(
-                    t,
-                    "core",
-                    "Core clock",
-                    format!("{} MHz", sm.core_clock_mhz),
-                ))
-                .child(stat(
-                    t,
-                    "mem",
-                    "Memory clock",
-                    format!("{} MHz", sm.mem_clock_mhz),
-                ))
-                .child(stat(
-                    t,
-                    "power",
-                    "Power",
-                    format!("{:.0} / {:.0} W", sm.power_w, sm.power_limit_w),
-                )),
-        )
-        .child(
-            row()
-                .gap(space::S6)
-                .child(stat(
-                    t,
-                    "util",
-                    "Utilisation",
-                    format!("{} %", sm.util_gpu_pct),
-                ))
-                .child(stat(
-                    t,
-                    "vram",
-                    "VRAM",
-                    format!("{} / {} MiB", sm.vram_used_mb, sm.vram_total_mb),
-                ))
-                .child(stat(
-                    t,
-                    "pstate",
-                    "Performance state",
-                    format!("P{}", sm.pstate),
-                ))
-                .child(
-                    match (s.caps.as_ref().map_or(0, |c| c.num_fans), sm.fan_pct) {
-                        (0, _) | (_, None) => el(),
-                        (_, Some(f)) => stat(t, "fan", "Fan", format!("{f} %")),
-                    },
-                ),
-        );
-    if !sm.throttle_reasons.is_empty() {
-        root = root.child(
-            text(format!("Throttling: {}", sm.throttle_reasons.join(", ")))
-                .key("throttle")
-                .font(type_::LABEL)
-                .color(t.text_secondary),
-        );
-    }
-    root = root.child(graph(t, accent, s, sm.power_limit_w));
 
-    // Controls exist only while the daemon answers, never as inert widgets.
-    if s.caps.is_some() && s.connected() {
-        let link = s.link.lock().unwrap();
-        root = root
-            .child(
-                text("Controls")
-                    .font(type_::SECTION)
-                    .color(t.text_secondary),
-            )
-            .child(slider(
-                t,
-                accent,
-                "core-offset",
-                "Core offset",
-                "MHz",
-                Knob::Core,
-                s,
-            ))
-            .child(slider(
-                t,
-                accent,
-                "mem-offset",
-                "Memory offset",
-                "MHz",
-                Knob::Mem,
-                s,
-            ))
-            .child(slider(
-                t,
-                accent,
-                "power-limit",
-                "Power limit",
-                "W",
-                Knob::Power,
-                s,
-            ))
-            .child(slider(
-                t,
-                accent,
-                "lock-ceiling",
-                "Clock ceiling",
-                "MHz",
-                Knob::Ceiling,
-                s,
-            ))
-            .child(
+    let stage = match s.open {
+        None => {
+            let rows = (0..2).map(|r| {
+                (0..4).fold(row().gap(space::S2).grow(1.0), |row_, c| {
+                    row_.child(tile(r * 4 + c, Mode::Rest, &p, t, s, sm))
+                })
+            });
+            rows.fold(col().gap(space::S2).grow(1.0), |c, r| c.child(r))
+        }
+        Some(o) => {
+            let others: Vec<usize> = (0..TILES).filter(|i| *i != o).collect();
+            let side = others
+                .chunks(2)
+                .fold(col().gap(space::S2).w(10.0).grow(1.0), |c, pair| {
+                    c.child(pair.iter().fold(row().gap(space::S2).grow(1.0), |r, i| {
+                        r.child(tile(*i, Mode::Compact, &p, t, s, sm))
+                    }))
+                });
+            col().gap(space::S2).grow(1.0).child(
                 row()
-                    .gap(space::S3)
-                    .center_y()
-                    .child(reset_button(t))
-                    .child(
-                        text(link.message.clone())
-                            .key("message")
-                            .font(type_::LABEL)
-                            .color(t.text_secondary),
-                    ),
-            );
-    } else {
-        root = root.child(
-            text("overrunerd is not reachable: showing read-only metrics. Reconnecting…")
-                .key("read-only")
-                .font(type_::LABEL)
-                .color(t.text_secondary),
-        );
-    }
-    root
+                    .gap(space::S2)
+                    .grow(1.0)
+                    .child(tile(o, Mode::Open, &p, t, s, sm))
+                    .child(side),
+            )
+        }
+    };
+    root.child(grid_backdrop(&p))
+        .child(ticker(&p, s, sm))
+        .child(stage)
 }
 
 fn main() {
