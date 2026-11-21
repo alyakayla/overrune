@@ -1052,36 +1052,381 @@ mod tests {
         for i in 0..HISTORY + 5 {
             push_capped(&mut v, i as f32);
         }
-        assert_eq!((v.len(), v[0]), (HISTORY, 5.0));
+        assert_eq!(v, (5..HISTORY + 5).map(|i| i as f32).collect::<Vec<_>>());
+    }
+
+    fn sample() -> Sample {
+        Sample {
+            name: "Test GPU".into(),
+            bus_id: "0".into(),
+            driver_version: "1".into(),
+            core_clock_mhz: 915,
+            mem_clock_mhz: 7000,
+            temp_c: 63,
+            power_w: 42.8,
+            power_limit_w: 80.0,
+            util_gpu_pct: 75,
+            util_mem_pct: 25,
+            vram_used_mb: 256,
+            vram_total_mb: 1024,
+            pstate: 2,
+            core_offset_mhz: 30,
+            mem_offset_mhz: -45,
+            fan_pct: None,
+            throttle_reasons: vec![],
+        }
+    }
+
+    fn test_state() -> (State, Receiver<Request>) {
+        let (to_daemon, rx) = channel();
+        let state = State {
+            gpu: None,
+            caps: Some(caps()),
+            sample: Some(sample()),
+            error: None,
+            temps: vec![],
+            powers: vec![],
+            next_sample: 0.0,
+            edits: ProfileSettings::default(),
+            pending_since: None,
+            dragging: false,
+            synced: false,
+            to_daemon,
+            worker_rx: None,
+            link: Arc::default(),
+            seen_generation: 0,
+            open: None,
+        };
+        (state, rx)
+    }
+
+    fn runtime(s: State) -> rune::Runtime<State> {
+        let mut rt = rune::Runtime::new(s, view, (620.0, 640.0), rune::Env::new(true, 1.0));
+        rt.set_system_reduced_motion(true);
+        rt
+    }
+
+    fn click(rt: &mut rune::Runtime<State>, key: &str) {
+        let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing {key}"));
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+    }
+
+    fn daemon_status(core_offset_mhz: i32) -> DaemonStatus {
+        DaemonStatus {
+            active_profile: None,
+            enforcing: ProfileSettings {
+                core_offset_mhz: Some(core_offset_mhz),
+                ..Default::default()
+            },
+            curve_ceiling_mhz: None,
+        }
     }
 
     #[test]
     fn without_a_daemon_the_window_is_read_only() {
-        let mut s = State::new();
-        s.sample = Some(Sample {
-            name: "x".into(),
-            bus_id: "0".into(),
-            driver_version: "1".into(),
-            core_clock_mhz: 1,
-            mem_clock_mhz: 1,
-            temp_c: 1,
-            power_w: 1.0,
-            power_limit_w: 80.0,
-            util_gpu_pct: 0,
-            util_mem_pct: 0,
-            vram_used_mb: 0,
-            vram_total_mb: 1,
-            pstate: 0,
-            core_offset_mhz: 0,
-            mem_offset_mhz: 0,
-            fan_pct: None,
-            throttle_reasons: vec![],
-        });
-        s.caps = Some(caps());
-        let mut rt = rune::Runtime::new(s, view, (620.0, 640.0), rune::Env::new(true, 1.0));
+        let (mut s, _) = test_state();
+        s.open = Some(5);
+        let mut rt = runtime(s);
         rt.frame(0.0);
         assert!(rt.find("read-only").is_some());
+        assert!(rt.find("tuning-unavailable").is_some());
+        for key in [
+            "core-offset",
+            "mem-offset",
+            "power-limit",
+            "lock-ceiling",
+            "reset",
+        ] {
+            assert!(rt.find(key).is_none(), "{key} should be hidden");
+        }
+    }
+
+    #[test]
+    fn connected_dashboard_reveals_controls_only_in_the_expanded_tuning_tile() {
+        let (s, _) = test_state();
+        s.link.lock().unwrap().connected = true;
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+        assert!(rt.find("daemon").is_some());
         assert!(rt.find("core-offset").is_none());
-        assert!(rt.find("fan").is_none());
+
+        click(&mut rt, "tile-5");
+        for key in [
+            "core-offset",
+            "mem-offset",
+            "power-limit",
+            "lock-ceiling",
+            "reset",
+        ] {
+            assert!(rt.find(key).is_some(), "{key} should be visible");
+        }
+        assert!(rt.find("tuning-unavailable").is_none());
+
+        click(&mut rt, "tile-5");
+        assert!(rt.find("core-offset").is_none());
+        assert!(rt.find("reset").is_none());
+    }
+
+    #[test]
+    fn reset_clears_edits_and_cancels_a_pending_apply() {
+        let (mut s, rx) = test_state();
+        s.link.lock().unwrap().connected = true;
+        s.open = Some(5);
+        s.edits = daemon_status(120).enforcing;
+        s.pending_since = Some(0.0);
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+
+        click(&mut rt, "reset");
+        assert_eq!(rt.state.edits, ProfileSettings::default());
+        assert_eq!(rx.try_recv(), Ok(Request::Reset));
+        poll(&mut rt.state, 1.0, &mut Tx::default());
+        assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn metrics_wait_for_a_sample_and_history_is_shown_only_for_the_expanded_tile() {
+        let (mut s, _) = test_state();
+        s.sample = None;
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+        assert!(rt.find("error").is_some());
+        assert!(rt.find("tile-0").is_none());
+
+        let (mut s, _) = test_state();
+        s.open = Some(0);
+        s.temps = vec![60.0, 63.0];
+        s.powers = vec![40.0, 42.8];
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+        assert!(rt.find("error").is_none());
+        assert!(rt.find("graph-temp").is_some());
+        assert!(rt.find("graph-power").is_none());
+    }
+
+    #[test]
+    fn tile_icons_decode_to_visible_rectangles_within_the_design_bounds() {
+        assert_eq!(icon_rects(0).first(), Some(&[36.0, 8.0, 24.0, 4.0]));
+        for i in 0..TILES {
+            let rects = icon_rects(i);
+            assert!(!rects.is_empty(), "tile {i} has no icon");
+            for &[x, y, w, h] in rects {
+                assert!(
+                    x >= 0.0 && y >= 0.0 && w > 0.0 && h > 0.0 && x + w <= 96.0 && y + h <= 96.0,
+                    "tile {i} has an invalid rectangle: {:?}",
+                    [x, y, w, h]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_shows_fan_telemetry_only_when_supported_and_sampled() {
+        for (num_fans, fan_pct, visible) in
+            [(0, Some(45), false), (1, None, false), (1, Some(45), true)]
+        {
+            let (mut s, _) = test_state();
+            s.caps.as_mut().unwrap().num_fans = num_fans;
+            s.sample.as_mut().unwrap().fan_pct = fan_pct;
+            let mut rt = runtime(s);
+            rt.frame(0.0);
+            assert_eq!(rt.find("fan").is_some(), visible, "{num_fans}, {fan_pct:?}");
+        }
+    }
+
+    #[test]
+    fn ceiling_tile_prefers_the_curve_then_falls_back_to_the_enforced_lock() {
+        let (s, _) = test_state();
+        let sm = s.sample.as_ref().unwrap();
+        assert_eq!(face(4, &s, sm).big, "—");
+
+        let mut status = daemon_status(0);
+        status.enforcing.lock_max_clock_mhz = Some(1200);
+        status.curve_ceiling_mhz = Some(900);
+        s.link.lock().unwrap().status = Some(status);
+        assert_eq!(face(4, &s, sm).big, "900");
+
+        s.link
+            .lock()
+            .unwrap()
+            .status
+            .as_mut()
+            .unwrap()
+            .curve_ceiling_mhz = None;
+        assert_eq!(face(4, &s, sm).big, "1200");
+    }
+
+    #[test]
+    fn slider_uses_edits_then_telemetry_then_capability_bounds() {
+        let (mut s, _) = test_state();
+        assert_eq!(current(&s, Knob::Core), 30.0);
+        assert_eq!(current(&s, Knob::Mem), -45.0);
+        assert_eq!(current(&s, Knob::Power), 80.0);
+        assert_eq!(current(&s, Knob::Ceiling), 1200.0);
+
+        // An explicit zero is still a local edit.
+        s.edits.core_offset_mhz = Some(0);
+        assert_eq!(current(&s, Knob::Core), 0.0);
+        s.edits = ProfileSettings::default();
+        s.sample = None;
+        assert_eq!(current(&s, Knob::Core), 200.0);
+        assert_eq!(current(&s, Knob::Power), 100.0);
+    }
+
+    #[test]
+    fn memory_edits_round_and_clamp_without_changing_other_knobs() {
+        let c = caps();
+        let mut e = daemon_status(30).enforcing;
+        set_knob(&mut e, &c, Knob::Mem, -42.5);
+        assert_eq!(e.mem_offset_mhz, Some(-43));
+        set_knob(&mut e, &c, Knob::Mem, -900.0);
+        assert_eq!(
+            e,
+            ProfileSettings {
+                core_offset_mhz: Some(30),
+                mem_offset_mhz: Some(-500),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn poll_applies_the_latest_edit_once_after_drag_and_debounce() {
+        let (mut s, rx) = test_state();
+        let mut tx = Tx::default();
+        s.edits = daemon_status(15).enforcing;
+        s.pending_since = Some(0.0);
+        s.dragging = true;
+        poll(&mut s, 1.0, &mut tx);
+        assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+
+        s.edits = daemon_status(35).enforcing;
+        s.pending_since = Some(1.0);
+        s.dragging = false;
+        poll(&mut s, 1.39, &mut tx);
+        assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+
+        poll(&mut s, 1.41, &mut tx);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Request::Apply(daemon_status(35).enforcing))
+        );
+        poll(&mut s, 2.0, &mut tx);
+        assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn poll_syncs_once_per_connection_and_preserves_local_edits_between_status_updates() {
+        let (mut s, _) = test_state();
+        let mut tx = Tx::default();
+        let link = s.link.clone();
+        {
+            let mut l = link.lock().unwrap();
+            l.connected = true;
+            l.generation += 1;
+        }
+        assert!(poll(&mut s, 0.0, &mut tx));
+        assert!(!s.synced, "a connection alone does not supply settings");
+
+        let publish = |connected, status| {
+            let mut l = link.lock().unwrap();
+            l.connected = connected;
+            l.status = status;
+            l.generation += 1;
+        };
+        publish(true, Some(daemon_status(20)));
+        assert!(poll(&mut s, 0.1, &mut tx));
+        assert_eq!(s.edits, daemon_status(20).enforcing);
+        assert!(!poll(&mut s, 0.2, &mut tx));
+
+        s.edits = daemon_status(45).enforcing;
+        publish(true, Some(daemon_status(25)));
+        assert!(poll(&mut s, 0.3, &mut tx));
+        assert_eq!(s.edits, daemon_status(45).enforcing);
+
+        publish(false, None);
+        assert!(poll(&mut s, 0.4, &mut tx));
+        publish(true, Some(daemon_status(60)));
+        assert!(poll(&mut s, 0.5, &mut tx));
+        assert_eq!(s.edits, daemon_status(60).enforcing);
+    }
+
+    #[test]
+    fn session_replays_only_the_latest_intent_then_refreshes_status_after_reset() {
+        let old = Request::Apply(daemon_status(10).enforcing);
+        let latest = Request::Apply(daemon_status(20).enforcing);
+        let mut intended = None;
+        remember(old, &mut intended);
+        remember(latest.clone(), &mut intended);
+        remember(Request::Status, &mut intended);
+
+        let (client, mut peer) = socket_pair();
+        let status = daemon_status(0);
+        // Queue the fake daemon replies in advance; no server thread or daemon is needed.
+        for reply in [
+            Response::Ok,
+            Response::Status(daemon_status(20)),
+            Response::Ok,
+            Response::Status(status.clone()),
+        ] {
+            write_msg(&mut peer, &reply).unwrap();
+        }
+        let (tx, rx) = channel();
+        tx.send(Request::Reset).unwrap();
+        drop(tx);
+        let link = Mutex::new(Link::default());
+        let wake: Waker = Arc::new(|| {});
+
+        session(client, &rx, &link, &wake, &mut intended).unwrap();
+
+        let mut reader = BufReader::new(peer);
+        let mut requests = Vec::new();
+        while let Some(req) = read_msg::<_, Request>(&mut reader).unwrap() {
+            requests.push(req);
+        }
+        assert_eq!(
+            requests,
+            [latest, Request::Status, Request::Reset, Request::Status]
+        );
+        assert_eq!(intended, None);
+        let l = link.into_inner().unwrap();
+        assert!(l.connected);
+        assert_eq!(l.status, Some(status));
+        assert_eq!(l.message, "Applied");
+    }
+
+    #[test]
+    fn session_preserves_an_apply_when_the_daemon_disconnects_before_replying() {
+        let (client, mut peer) = socket_pair();
+        write_msg(&mut peer, &Response::Status(daemon_status(0))).unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let (tx, rx) = channel();
+        let apply = Request::Apply(daemon_status(70).enforcing);
+        tx.send(apply.clone()).unwrap();
+        drop(tx);
+        let link = Mutex::new(Link::default());
+        let wake: Waker = Arc::new(|| {});
+        let mut intended = None;
+
+        let err = session(client, &rx, &link, &wake, &mut intended).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(intended, Some(apply));
+        assert_eq!(link.into_inner().unwrap().status, Some(daemon_status(0)));
+    }
+
+    fn socket_pair() -> (UnixStream, UnixStream) {
+        let (client, peer) = UnixStream::pair().unwrap();
+        for stream in [&client, &peer] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+        }
+        (client, peer)
     }
 }
