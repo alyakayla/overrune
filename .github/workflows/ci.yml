@@ -31,6 +31,7 @@ jobs:
       - run: sh -n dist/install.sh
       - name: Units and polkit action parse
         run: |
+          sudo apt-get install -y --no-install-recommends libxml2-utils
           mkdir -p /tmp/units && cp dist/*.service dist/*.socket /tmp/units/
           sed -i 's#^ExecStart=.*#ExecStart=/bin/true#' /tmp/units/*.service
           systemd-analyze verify /tmp/units/overrunerd.socket /tmp/units/*.service
