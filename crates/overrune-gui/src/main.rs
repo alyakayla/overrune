@@ -427,7 +427,7 @@ fn pal() -> Pal {
     let c = |h| rune::color::hex(h).expect("valid palette hex");
     Pal {
         ground: c("#0a0d14"),
-        glass: c("#ffffff0d"),
+        glass: c("#ffffff14"),
         edge: c("#ffffff1a"),
         grid: c("#5ab9fc0d"),
         ink: c("#e9edf3"),
@@ -549,7 +549,7 @@ fn kv(p: &Pal, key: &'static str, label: &'static str, value: String) -> El {
         .key(key)
         .justify_between()
         .py(space::S2)
-        .border_sides([0.0, 0.0, 0.0, 1.0], p.edge)
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.edge)
         .child(text(label).font(type_::SECTION).color(p.muted))
         .child(text(value).font(type_::BODY.mono()).color(p.ink))
 }
@@ -790,7 +790,7 @@ fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) ->
         .radius(tok::radius::SM)
         .border(1.0, p.edge)
         .fill(if accent_tile { p.accent } else { p.glass })
-        .backdrop_blur(14.0)
+        .backdrop_blur(8.0)
         .on_press(move |s: &mut State| {
             s.open = if s.open == Some(i) { None } else { Some(i) };
         })
