@@ -23,6 +23,8 @@ const HISTORY: usize = 120;
 const DEBOUNCE_S: f64 = 0.4;
 const MAX_BACKOFF_S: u64 = 15;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// The daemon answers nothing until polkit has authorized us, which can wait on a prompt.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What the connection thread tells the window.
 #[derive(Default)]
@@ -192,6 +194,7 @@ fn session(
         *intended = None; // acknowledged; a later status failure must not replay it
     }
     exchange(&mut w, &mut r, &Request::Status, link)?;
+    w.set_read_timeout(Some(IO_TIMEOUT))?;
     wake();
     while let Ok(req) = rx.recv() {
         remember(req.clone(), intended);
@@ -216,7 +219,7 @@ fn worker(rx: Receiver<Request>, link: Arc<Mutex<Link>>, wake: Waker) {
     let mut backoff = 1;
     loop {
         if let Ok(sock) = UnixStream::connect(socket_path()) {
-            let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = sock.set_read_timeout(Some(AUTH_TIMEOUT));
             let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
             backoff = 1;
             let _ = session(sock, &rx, &link, &wake, &mut intended);
