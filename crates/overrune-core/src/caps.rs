@@ -66,7 +66,13 @@ impl Gpu {
     pub fn capabilities(&self) -> Result<Capabilities, GpuError> {
         let dev = self.device()?;
         let constraints = dev.power_management_limit_constraints()?;
-        let mem_clock_mhz = dev.max_clock_info(Clock::Memory)?;
+        // `max_clock_info` can report a value the driver's own list lacks, and
+        // `supported_graphics_clocks` rejects that; ask with a listed clock.
+        let mem_clock_mhz = dev
+            .supported_memory_clocks()?
+            .into_iter()
+            .max()
+            .ok_or(nvml_wrapper::error::NvmlError::NotFound)?;
         let mut graphics_clocks_mhz = dev.supported_graphics_clocks(mem_clock_mhz)?;
         graphics_clocks_mhz.sort_unstable_by(|a, b| b.cmp(a));
         graphics_clocks_mhz.dedup();
