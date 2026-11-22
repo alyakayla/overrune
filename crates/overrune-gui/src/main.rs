@@ -13,8 +13,8 @@ use overrune_core::ipc::{DaemonStatus, Request, Response, read_msg, socket_path,
 use overrune_core::profile::ProfileSettings;
 use rune::tok::{self, space, type_};
 use rune::{
-    AppSpec, Color, Cx, Drag, El, LineCap, Phase, Shape, TextStyle, Tx, Waker, canvas, col, el,
-    row, text,
+    AppSpec, Color, Cx, Drag, El, LineCap, Phase, Shape, TextEdit, TextStyle, Tx, Waker, canvas,
+    col, el, row, text, text_input,
 };
 
 mod icons;
@@ -23,12 +23,15 @@ const HISTORY: usize = 120;
 const DEBOUNCE_S: f64 = 0.4;
 const MAX_BACKOFF_S: u64 = 15;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// The daemon answers nothing until polkit has authorized us, which can wait on a prompt.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What the connection thread tells the window.
 #[derive(Default)]
 struct Link {
     connected: bool,
     status: Option<DaemonStatus>,
+    profiles: Vec<String>,
     message: String,
     /// Bumped on every change so the poll can tell cheaply.
     generation: u64,
@@ -51,6 +54,11 @@ struct State {
     worker_rx: Option<Receiver<Request>>,
     link: Arc<Mutex<Link>>,
     seen_generation: u64,
+    /// The Profiles tile's new-profile field, shown while `creating`.
+    profile_name: TextEdit,
+    creating: bool,
+    /// The profile last activated here: what "save current" overwrites.
+    last_used: Option<String>,
     /// The tile currently expanded, if any.
     open: Option<usize>,
 }
@@ -84,8 +92,44 @@ impl State {
             worker_rx: Some(rx),
             link: Arc::default(),
             seen_generation: 0,
+            profile_name: TextEdit::default(),
+            creating: false,
+            last_used: None,
             open: None,
         }
+    }
+
+    /// Activates a saved profile. The sliders reload from what the daemon then
+    /// reports, so the status they would resync from is dropped until it does.
+    fn use_profile(&mut self, name: String) {
+        self.pending_since = None;
+        self.synced = false;
+        self.link.lock().unwrap().status = None;
+        self.last_used = Some(name.clone());
+        let _ = self.to_daemon.send(Request::UseProfile { name });
+    }
+
+    /// Saves the current edits under `name`. The daemon validates the name and
+    /// settings; its refusal shows in the message.
+    fn save_profile(&mut self, name: String) {
+        let _ = self.to_daemon.send(Request::SaveProfile {
+            name,
+            settings: self.edits.clone(),
+        });
+        let _ = self.to_daemon.send(Request::ListProfiles);
+    }
+
+    fn create_profile(&mut self) {
+        self.creating = false;
+        self.save_profile(self.profile_name.text.clone());
+    }
+
+    fn remove_profile(&mut self, name: String) {
+        if self.last_used.as_ref() == Some(&name) {
+            self.last_used = None;
+        }
+        let _ = self.to_daemon.send(Request::RemoveProfile { name });
+        let _ = self.to_daemon.send(Request::ListProfiles);
     }
 
     fn connected(&self) -> bool {
@@ -113,9 +157,15 @@ fn exchange(
         read_msg(r)?.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
     let mut l = link.lock().unwrap();
     match reply {
-        Response::Ok => l.message = "Applied".into(),
+        Response::Ok => {
+            l.message = match req {
+                Request::SaveProfile { name, .. } => format!("Saved {name}"),
+                Request::RemoveProfile { name } => format!("Removed {name}"),
+                _ => "Applied".into(),
+            }
+        }
         Response::Status(s) => l.status = Some(s),
-        Response::Profiles { .. } => {}
+        Response::Profiles { names } => l.profiles = names,
         Response::Error { message, .. } => l.message = message,
     }
     l.generation += 1;
@@ -144,6 +194,7 @@ fn session(
         *intended = None; // acknowledged; a later status failure must not replay it
     }
     exchange(&mut w, &mut r, &Request::Status, link)?;
+    w.set_read_timeout(Some(IO_TIMEOUT))?;
     wake();
     while let Ok(req) = rx.recv() {
         remember(req.clone(), intended);
@@ -168,7 +219,7 @@ fn worker(rx: Receiver<Request>, link: Arc<Mutex<Link>>, wake: Waker) {
     let mut backoff = 1;
     loop {
         if let Ok(sock) = UnixStream::connect(socket_path()) {
-            let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
+            let _ = sock.set_read_timeout(Some(AUTH_TIMEOUT));
             let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
             backoff = 1;
             let _ = session(sock, &rx, &link, &wake, &mut intended);
@@ -238,6 +289,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     {
         s.synced = true;
         s.edits = e;
+        let _ = s.to_daemon.send(Request::ListProfiles);
     }
     if let Some(t) = s.pending_since {
         if s.dragging {
@@ -448,6 +500,7 @@ struct Pal {
     grid: Color,
     ink: Color,
     muted: Color,
+    dim: Color,
     accent: Color,
     focus: Color,
     profiles: Color,
@@ -464,6 +517,7 @@ fn pal() -> Pal {
         grid: c("#5ab9fc0d"),
         ink: c("#e9edf3"),
         muted: c("#8891a1"),
+        dim: c("#5d6678"),
         accent: c("#5ab9fc"),
         focus: c("#131824EE"),
         profiles: c("#232c40"),
@@ -736,7 +790,7 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
                     format!("{} MHz", sm.core_clock_mhz),
                 ));
         }
-        5 => {
+        5 | 6 => {
             if s.caps.is_some() && s.connected() {
                 let link_msg = s.link.lock().unwrap().message.clone();
                 c = c
@@ -776,18 +830,30 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
                         Knob::Ceiling,
                         s,
                     ))
-                    .child(
-                        row()
+                    .child({
+                        let mut foot = row()
                             .gap(space::S3)
                             .center_y()
-                            .child(reset_button(t))
-                            .child(
-                                text(link_msg)
-                                    .key("message")
-                                    .font(type_::LABEL)
-                                    .color(p.muted),
-                            ),
-                    );
+                            .child(reset_button(t));
+                        if i == 6
+                            && let Some(name) = s.last_used.clone()
+                        {
+                            foot = foot.child(
+                                pressable("profile-save".into(), format!("Save current as {name}"))
+                                    .px(16.0)
+                                    .py(space::S3)
+                                    .fill(p.accent)
+                                    .on_press(move |s: &mut State| s.save_profile(name.clone()))
+                                    .child(text("SAVE CURRENT").font(type_::LABEL).color(p.ground)),
+                            );
+                        }
+                        foot.child(
+                            text(link_msg)
+                                .key("message")
+                                .font(type_::LABEL)
+                                .color(p.muted),
+                        )
+                    });
             } else {
                 c = c.child(
                     text("overrunerd is not reachable: showing read-only metrics. Reconnecting…")
@@ -800,34 +866,7 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
         _ => {
             let link = s.link.lock().unwrap();
             if let Some(st) = &link.status {
-                let e = &st.enforcing;
-                let show = |v: Option<String>| v.unwrap_or_else(|| "default".into());
-                c = c
-                    .child(kv(p, "x-prof", "PROFILE", show(st.active_profile.clone())))
-                    .child(kv(
-                        p,
-                        "x-ecore",
-                        "CORE OFFSET",
-                        show(e.core_offset_mhz.map(|v| format!("{v:+} MHz"))),
-                    ))
-                    .child(kv(
-                        p,
-                        "x-emem",
-                        "MEMORY OFFSET",
-                        show(e.mem_offset_mhz.map(|v| format!("{v:+} MHz"))),
-                    ))
-                    .child(kv(
-                        p,
-                        "x-epow",
-                        "POWER LIMIT",
-                        show(e.power_limit_w.map(|v| format!("{v:.0} W"))),
-                    ))
-                    .child(kv(
-                        p,
-                        "x-elock",
-                        "CLOCK CEILING",
-                        show(e.lock_max_clock_mhz.map(|v| format!("{v} MHz"))),
-                    ));
+                c = profiles(p, s, st, &link);
             } else {
                 c = c.child(
                     text("No daemon: nothing is being enforced.")
@@ -839,6 +878,177 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
         }
     }
     c
+}
+
+/// One-line digest of what a profile sets.
+fn summary(e: &ProfileSettings) -> String {
+    let parts: Vec<String> = [
+        e.core_offset_mhz.map(|v| format!("{v:+} core")),
+        e.mem_offset_mhz.map(|v| format!("{v:+} mem")),
+        e.power_limit_w.map(|v| format!("{v:.0} W")),
+        e.lock_max_clock_mhz.map(|v| format!("{v} cap")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "all defaults".into()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// A button-role element whose look the caller supplies.
+fn pressable(key: String, label: String) -> El {
+    el().key(key).role("button").label(label).focusable(true)
+}
+
+/// Pixel-art glyph from `[x, y, w, h]` rectangles in a `size`-point box.
+fn glyph(rects: &[[f32; 4]], size: f32, color: Color) -> El {
+    let mut shape = Shape::new();
+    for [x, y, w, h] in rects {
+        shape = shape.fill(
+            vec![[*x, *y], [x + w, *y], [x + w, y + h], [*x, y + h]],
+            color,
+        );
+    }
+    canvas(shape.view_box(size, size))
+        .size(size, size)
+        .a11y_hidden()
+}
+
+const TRASH: [[f32; 4]; 7] = [
+    [6.0, 1.0, 4.0, 2.0],
+    [2.0, 3.0, 12.0, 2.0],
+    [3.0, 5.0, 10.0, 1.0],
+    [4.0, 6.0, 2.0, 8.0],
+    [7.0, 6.0, 2.0, 8.0],
+    [10.0, 6.0, 2.0, 8.0],
+    [4.0, 14.0, 8.0, 1.0],
+];
+const PLUS: [[f32; 4]; 2] = [[6.0, 1.0, 2.0, 12.0], [1.0, 6.0, 12.0, 2.0]];
+
+/// The expanded Profiles tile: saved profiles with use/remove, a "+" that
+/// reveals the new-profile form, and "save current" for the last-used one.
+fn profiles(p: &Pal, s: &State, st: &DaemonStatus, link: &Link) -> El {
+    let name_style = TextStyle::new(18.0, 400.0).mono();
+    let mut c = col().gap(space::S2);
+    let mut list = col();
+    if link.profiles.is_empty() {
+        list = list.child(
+            text("No saved profiles")
+                .key("no-profiles")
+                .font(type_::LABEL)
+                .color(p.muted),
+        );
+    }
+    for name in &link.profiles {
+        let active = st.active_profile.as_ref() == Some(name);
+        let mut names = col()
+            .gap(space::S1)
+            .child(text(name.clone()).font(name_style).color(p.ink));
+        let right = if active {
+            names = names.child(
+                text(summary(&st.enforcing))
+                    .font(type_::SECTION)
+                    .color(p.muted),
+            );
+            row()
+                .child(
+                    text("● ACTIVE")
+                        .font(type_::SECTION)
+                        .color(p.accent)
+                        .key(format!("active-{name}")),
+                )
+                .mr(30.0)
+        } else {
+            let (use_name, rm_name) = (name.clone(), name.clone());
+            row()
+                .gap(14.0)
+                .center_y()
+                .child(
+                    pressable(format!("use-{name}"), format!("Use {name}"))
+                        .on_press(move |s: &mut State| s.use_profile(use_name.clone()))
+                        .child(text("USE").font(type_::SECTION).color(p.dim)),
+                )
+                .child(
+                    pressable(format!("rm-{name}"), format!("Remove {name}"))
+                        .on_press(move |s: &mut State| s.remove_profile(rm_name.clone()))
+                        .child(glyph(&TRASH, 16.0, p.dim)),
+                )
+        };
+        list = list.child(
+            row()
+                .key(format!("profile-{name}"))
+                .justify_between()
+                .center_y()
+                .px(space::S3)
+                .py(14.0)
+                .border_sides([1.0, 0.0, 0.0, 0.0], p.edge)
+                .fill(if active {
+                    p.accent.alpha(0.1)
+                } else {
+                    Color::TRANSPARENT
+                })
+                .child(names)
+                .child(right),
+        );
+    }
+    c = c.child(list).child(
+        row()
+            .px(space::S3)
+            .pt(space::S2)
+            .child(el().grow(1.0))
+            .child(
+                pressable("profile-new".into(), "New profile".into())
+                    .size(28.0, 28.0)
+                    .center()
+                    .border(1.0, p.accent)
+                    .on_press(|s: &mut State| s.creating = !s.creating)
+                    .child(glyph(&PLUS, 14.0, p.accent)),
+            ),
+    );
+    if s.creating {
+        c = c.child(
+            row()
+                .key("profile-form")
+                .gap(space::S3)
+                .center_y()
+                .padding(space::S3)
+                .fill(p.accent.alpha(0.05))
+                .border(1.0, p.accent.alpha(0.33))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .gap(space::S1)
+                        .child(text("NEW PROFILE").font(type_::SECTION).color(p.muted))
+                        .child(
+                            text_input(&s.profile_name, name_style)
+                                .key("profile-name")
+                                .single_line()
+                                .border_sides([0.0, 0.0, 1.0, 0.0], p.accent)
+                                .color(p.ink)
+                                .caret(p.accent, p.accent.alpha(0.3))
+                                .on_edit(|s: &mut State| &mut s.profile_name)
+                                .on_submit(|s: &mut State, _| s.create_profile()),
+                        ),
+                )
+                .child(
+                    pressable("profile-create".into(), "Create profile".into())
+                        .px(16.0)
+                        .py(space::S3)
+                        .fill(p.accent)
+                        .on_press(|s: &mut State| s.create_profile())
+                        .child(text("CREATE").font(type_::LABEL).color(p.ground)),
+                ),
+        );
+    }
+    c.child(
+        text(link.message.clone())
+            .key("profile-message")
+            .font(type_::LABEL)
+            .color(p.muted),
+    )
 }
 
 fn tile(i: usize, mode: Mode, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
@@ -1141,6 +1351,9 @@ mod tests {
             worker_rx: None,
             link: Arc::default(),
             seen_generation: 0,
+            profile_name: TextEdit::default(),
+            creating: false,
+            last_used: None,
             open: None,
         };
         (state, rx)
@@ -1230,6 +1443,196 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(Request::Reset));
         poll(&mut rt.state, 1.0, &mut Tx::default());
         assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+    }
+
+    fn profile_state(open_form: bool) -> (State, Receiver<Request>) {
+        let (mut s, rx) = test_state();
+        s.open = Some(7);
+        s.creating = open_form;
+        s.edits = daemon_status(40).enforcing;
+        let mut st = daemon_status(40);
+        st.active_profile = Some("undervolt".into());
+        {
+            let mut l = s.link.lock().unwrap();
+            l.connected = true;
+            l.status = Some(st);
+            l.profiles = vec!["undervolt".into(), "fast".into()];
+        }
+        (s, rx)
+    }
+
+    #[test]
+    fn profile_controls_need_the_daemon_and_the_form_waits_for_plus() {
+        let (mut s, _) = test_state();
+        s.open = Some(7);
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+        assert!(rt.find("enforced-none").is_some());
+        assert!(rt.find("profile-new").is_none());
+
+        let (s, _) = profile_state(false);
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+        for key in ["profile-new", "use-fast", "rm-fast"] {
+            assert!(rt.find(key).is_some(), "{key} should be visible");
+        }
+        // The active profile has neither a USE nor a trash can; nothing is saveable yet.
+        for key in [
+            "use-undervolt",
+            "rm-undervolt",
+            "profile-name",
+            "profile-save",
+        ] {
+            assert!(rt.find(key).is_none(), "{key} should be hidden");
+        }
+        assert!(rt.find("active-undervolt").is_some());
+
+        click(&mut rt, "profile-new");
+        assert!(rt.find("profile-name").is_some());
+        assert!(rt.find("profile-create").is_some());
+        click(&mut rt, "profile-new");
+        assert!(rt.find("profile-name").is_none());
+    }
+
+    #[test]
+    fn creating_removing_using_and_saving_profiles_send_the_matching_requests() {
+        let (s, rx) = profile_state(true);
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+
+        rt.state.profile_name.replace_text("night");
+        click(&mut rt, "profile-create");
+        assert!(!rt.state.creating, "creating closes the form");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Request::SaveProfile {
+                name: "night".into(),
+                settings: daemon_status(40).enforcing,
+            })
+        );
+        assert_eq!(rx.try_recv(), Ok(Request::ListProfiles));
+
+        click(&mut rt, "use-fast");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Request::UseProfile {
+                name: "fast".into()
+            })
+        );
+        assert_eq!(rt.state.last_used.as_deref(), Some("fast"));
+        // Using a profile drops the status until the daemon republishes it.
+        rt.state.link.lock().unwrap().status = Some(daemon_status(40));
+        rt.invalidate();
+        rt.frame(1.0);
+        rt.state.open = Some(6);
+        rt.invalidate();
+        rt.frame(1.1);
+
+        click(&mut rt, "profile-save");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Request::SaveProfile {
+                name: "fast".into(),
+                settings: daemon_status(40).enforcing,
+            })
+        );
+        assert_eq!(rx.try_recv(), Ok(Request::ListProfiles));
+        rt.state.open = Some(7);
+        rt.invalidate();
+        rt.frame(1.2);
+
+        click(&mut rt, "rm-fast");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Request::RemoveProfile {
+                name: "fast".into()
+            })
+        );
+        assert_eq!(rx.try_recv(), Ok(Request::ListProfiles));
+        assert_eq!(
+            rt.state.last_used, None,
+            "a removed profile is no save target"
+        );
+    }
+
+    #[test]
+    fn using_a_profile_loads_what_the_daemon_then_enforces_into_the_sliders() {
+        let (mut s, rx) = profile_state(false);
+        let mut tx = Tx::default();
+        s.synced = true;
+        s.pending_since = Some(0.0);
+        let mut rt = runtime(s);
+        rt.frame(0.0);
+
+        click(&mut rt, "use-fast");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(Request::UseProfile {
+                name: "fast".into()
+            })
+        );
+        assert_eq!(rt.state.pending_since, None);
+
+        // Until the daemon reports the new settings, the old ones must not come back.
+        poll(&mut rt.state, 0.1, &mut tx);
+        assert_eq!(rt.state.edits, daemon_status(40).enforcing);
+        assert!(!rt.state.synced);
+
+        {
+            let mut l = rt.state.link.lock().unwrap();
+            l.status = Some(daemon_status(90));
+            l.generation += 1;
+        }
+        poll(&mut rt.state, 0.2, &mut tx);
+        assert_eq!(rt.state.edits, daemon_status(90).enforcing);
+    }
+
+    #[test]
+    fn a_profile_summary_lists_only_what_it_sets() {
+        assert_eq!(summary(&ProfileSettings::default()), "all defaults");
+        let e = ProfileSettings {
+            core_offset_mhz: Some(120),
+            power_limit_w: Some(55.0),
+            lock_max_clock_mhz: Some(1695),
+            ..Default::default()
+        };
+        assert_eq!(summary(&e), "+120 core · 55 W · 1695 cap");
+    }
+
+    #[test]
+    fn session_publishes_profile_lists_and_daemon_refusals() {
+        let (client, mut peer) = socket_pair();
+        let refusal = "profile name \"bad name\" is not allowed";
+        for reply in [
+            Response::Status(daemon_status(0)),
+            Response::Error {
+                kind: overrune_core::ipc::ErrorKind::OutOfRange,
+                message: refusal.into(),
+            },
+            Response::Status(daemon_status(0)),
+            Response::Profiles {
+                names: vec!["fast".into()],
+            },
+            Response::Status(daemon_status(0)),
+        ] {
+            write_msg(&mut peer, &reply).unwrap();
+        }
+        let (tx, rx) = channel();
+        tx.send(Request::SaveProfile {
+            name: "bad name".into(),
+            settings: ProfileSettings::default(),
+        })
+        .unwrap();
+        tx.send(Request::ListProfiles).unwrap();
+        drop(tx);
+        let link = Mutex::new(Link::default());
+        let wake: Waker = Arc::new(|| {});
+
+        session(client, &rx, &link, &wake, &mut None).unwrap();
+
+        let l = link.into_inner().unwrap();
+        assert_eq!(l.message, refusal);
+        assert_eq!(l.profiles, ["fast"]);
     }
 
     #[test]
