@@ -787,7 +787,7 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
                     format!("{} MHz", sm.core_clock_mhz),
                 ));
         }
-        5 => {
+        5 | 6 => {
             if s.caps.is_some() && s.connected() {
                 let link_msg = s.link.lock().unwrap().message.clone();
                 c = c
@@ -827,18 +827,30 @@ fn body(i: usize, p: &Pal, t: tok::Theme, s: &State, sm: &Sample) -> El {
                         Knob::Ceiling,
                         s,
                     ))
-                    .child(
-                        row()
+                    .child({
+                        let mut foot = row()
                             .gap(space::S3)
                             .center_y()
-                            .child(reset_button(t))
-                            .child(
-                                text(link_msg)
-                                    .key("message")
-                                    .font(type_::LABEL)
-                                    .color(p.muted),
-                            ),
-                    );
+                            .child(reset_button(t));
+                        if i == 6
+                            && let Some(name) = s.last_used.clone()
+                        {
+                            foot = foot.child(
+                                pressable("profile-save".into(), format!("Save current as {name}"))
+                                    .px(16.0)
+                                    .py(space::S3)
+                                    .fill(p.accent)
+                                    .on_press(move |s: &mut State| s.save_profile(name.clone()))
+                                    .child(text("SAVE CURRENT").font(type_::LABEL).color(p.ground)),
+                            );
+                        }
+                        foot.child(
+                            text(link_msg)
+                                .key("message")
+                                .font(type_::LABEL)
+                                .color(p.muted),
+                        )
+                    });
             } else {
                 c = c.child(
                     text("overrunerd is not reachable: showing read-only metrics. Reconnecting…")
@@ -1028,24 +1040,11 @@ fn profiles(p: &Pal, s: &State, st: &DaemonStatus, link: &Link) -> El {
                 ),
         );
     }
-    let mut foot = row().gap(space::S3).center_y();
-    if let Some(name) = s.last_used.clone() {
-        foot = foot.child(
-            pressable("profile-save".into(), format!("Save current as {name}"))
-                .px(16.0)
-                .py(space::S3)
-                .fill(p.accent)
-                .on_press(move |s: &mut State| s.save_profile(name.clone()))
-                .child(text("SAVE CURRENT").font(type_::LABEL).color(p.ground)),
-        );
-    }
     c.child(
-        foot.child(
-            text(link.message.clone())
-                .key("profile-message")
-                .font(type_::LABEL)
-                .color(p.muted),
-        ),
+        text(link.message.clone())
+            .key("profile-message")
+            .font(type_::LABEL)
+            .color(p.muted),
     )
 }
 
@@ -1522,6 +1521,9 @@ mod tests {
         rt.state.link.lock().unwrap().status = Some(daemon_status(40));
         rt.invalidate();
         rt.frame(1.0);
+        rt.state.open = Some(6);
+        rt.invalidate();
+        rt.frame(1.1);
 
         click(&mut rt, "profile-save");
         assert_eq!(
@@ -1532,6 +1534,9 @@ mod tests {
             })
         );
         assert_eq!(rx.try_recv(), Ok(Request::ListProfiles));
+        rt.state.open = Some(7);
+        rt.invalidate();
+        rt.frame(1.2);
 
         click(&mut rt, "rm-fast");
         assert_eq!(
